@@ -1,5 +1,6 @@
-datasets/
-cs537aiot
-datasets_unified/
+/datasets/
+/cs537aiot
+/datasets_unified/
 .venv/
 __pycache__/
+.vscode
