@@ -1,4 +1,9 @@
-"""Turn waveforms into model inputs with a run-time STFT."""
+"""Turn waveforms into model inputs with a run-time STFT.
+
+``SpectralTransform`` is an ``nn.Module`` so it can run either inside the DataLoader workers
+(on single examples, on the CPU) or on a batch on the GPU; both give the same result. It only
+touches the modality keys of an example and passes every other key through.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,19 @@ from iobtwm.data.config import Modality, SpectralConfig
 
 
 def _frame_length(seconds: float, rate: int, what: str) -> int:
+    """Convert an STFT duration to whole samples.
+
+    Args:
+        seconds: The duration.
+        rate: Sample rate in Hz.
+        what: Name of the setting, for the error message.
+
+    Returns:
+        The duration in samples.
+
+    Raises:
+        ValueError: If ``seconds`` is not a positive whole number of samples at ``rate``.
+    """
     samples = seconds * rate
     if not math.isclose(samples, round(samples)) or round(samples) < 1:
         raise ValueError(f"STFT {what} of {seconds} s is not whole samples at {rate} Hz")
@@ -25,10 +43,18 @@ class SpectralTransform(nn.Module):
     (magnitude, log magnitude) or two (complex: real, imag). With representation ``waveform`` the
     inputs pass through unchanged. Frames do not overlap the window edges (``center=False``), so
     every frame only sees samples inside the example.
+
+    Attributes:
+        config: The spectral settings.
+        frames: (FFT length, hop) in samples per modality.
     """
 
     def __init__(self, config: SpectralConfig, rates: Mapping[Modality, int]) -> None:
         """Prepare the STFT window of every modality.
+
+        Args:
+            config: Spectral settings.
+            rates: Sample rate of every modality that will be transformed.
 
         Raises:
             ValueError: If the frame or hop length is not a whole number of samples.
@@ -44,10 +70,19 @@ class SpectralTransform(nn.Module):
                 window = torch.hann_window(n_fft, periodic=True)
             else:
                 window = torch.ones(n_fft)
+            # A buffer moves with .to(device) but is not saved in checkpoints.
             self.register_buffer(f"window_{modality}", window, persistent=False)
 
     def output_shape(self, modality: Modality, num_samples: int) -> tuple[int, ...]:
-        """Return the per-example output shape for a waveform of ``num_samples`` samples."""
+        """Return the per-example output shape for a waveform of a given length.
+
+        Args:
+            modality: Which modality.
+            num_samples: Waveform length in samples.
+
+        Returns:
+            ``(num_samples,)`` for ``waveform``, else ``(channels, freq, frames)``.
+        """
         if self.config.representation == "waveform":
             return (num_samples,)
         n_fft, hop = self.frames[modality]
@@ -55,11 +90,21 @@ class SpectralTransform(nn.Module):
         return (channels, n_fft // 2 + 1, (num_samples - n_fft) // hop + 1)
 
     def transform(self, modality: Modality, wave: Tensor) -> Tensor:
-        """Transform one modality's waveforms of shape ``[..., time]``."""
+        """Transform the waveforms of one modality.
+
+        Args:
+            modality: Which modality.
+            wave: Waveforms of shape ``[..., time]``.
+
+        Returns:
+            ``wave`` itself for ``waveform``, else spectra of shape
+            ``[..., channels, freq, frames]``.
+        """
         if self.config.representation == "waveform":
             return wave
         n_fft, hop = self.frames[modality]
         lead = wave.shape[:-1]
+        # torch.stft takes [batch, time]; fold all leading dimensions into the batch.
         spec = torch.stft(
             wave.reshape(-1, wave.shape[-1]),
             n_fft=n_fft,
@@ -78,7 +123,14 @@ class SpectralTransform(nn.Module):
         return out.reshape(*lead, *out.shape[1:])
 
     def forward(self, inputs: Mapping[str, Tensor]) -> dict[str, Tensor]:
-        """Return a copy of ``inputs`` with every modality transformed."""
+        """Transform every modality of an example or batch.
+
+        Args:
+            inputs: An example or batch; keys that are not modalities are passed through.
+
+        Returns:
+            A new dict with the modality entries transformed.
+        """
         out = dict(inputs)
         for modality in self.frames:
             if modality in out:

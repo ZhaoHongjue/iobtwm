@@ -2,7 +2,10 @@
 
 Every choice that matters for experiments is a field here, so it can be swept later without
 touching code: which subsets to use, how to split them, how to cut training windows, and how to
-turn waveforms into model inputs.
+turn waveforms into model inputs. ``DataConfig`` is the single entry point; ``SplitConfig``,
+``SamplingConfig`` and ``SpectralConfig`` group the settings of one pipeline stage each. All
+configs are frozen dataclasses that validate themselves on construction, so a bad value fails
+before any data is read.
 """
 
 from __future__ import annotations
@@ -13,16 +16,34 @@ from pathlib import Path
 from typing import Final, Literal
 
 Modality = Literal["audio", "seismic"]
+"""A sensing modality stored in the unified ``signals.h5`` files."""
+
 SplitName = Literal["train", "val", "test"]
+"""Name of a data split. Its index in ``SPLIT_NAMES`` is the split code used internally."""
+
 SplitStrategy = Literal["random_clip", "time", "record", "official", "holdout"]
+"""How clips are assigned to splits, see ``SplitConfig.strategy``."""
+
 StratifyKey = Literal["dataset", "scene", "labels"]
+"""A property that recordings are grouped by before the ``record`` split divides them."""
+
 SamplingMode = Literal["clip", "multi_clip", "random_crop"]
+"""How examples are cut out of the recordings, see ``SamplingConfig.mode``."""
+
 Representation = Literal["waveform", "magnitude", "log_magnitude", "complex"]
+"""What the model receives per modality, see ``SpectralConfig.representation``."""
+
 WindowFunction = Literal["hann", "rect"]
+"""STFT analysis window."""
+
 SpectralPlacement = Literal["loader", "device"]
+"""Where the STFT runs, see ``SpectralConfig.placement``."""
+
 Normalization = Literal["none", "node", "dataset"]
+"""Grouping of the amplitude normalisation, see ``DataConfig.normalization``."""
 
 SPLIT_NAMES: Final[tuple[SplitName, ...]] = ("train", "val", "test")
+"""All split names in code order: code 0 is train, 1 is val, 2 is test."""
 
 # Waveform subsets without duplicated recordings (see docs/tasks). Excluded on purpose:
 # GQ *Filtered*/random/Mixed (subsets of sensor_all or synthetic), 2024-08-07-GQ_past (contained
@@ -45,6 +66,7 @@ DEFAULT_SUBSETS: Final[tuple[str, ...]] = (
     "M3N-VC/i29/individual_time_samples",
     "M3N-VC/s31/individual_time_samples",
 )
+"""Subsets loaded by default, relative to ``DataConfig.root``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +75,9 @@ class SplitConfig:
 
     Attributes:
         strategy: ``random_clip`` assigns every clip independently at random, as the early group
-            papers did on MOD (leaks neighbouring clips across splits). ``time`` cuts each
-            recording chronologically into train, then val, then test. ``record`` keeps every
-            recording (run) whole and assigns recordings to splits. ``official`` uses the
+            papers did on MOD (leaks neighbouring clips across splits). ``time`` (default) cuts
+            each recording chronologically into train, then val, then test. ``record`` keeps
+            every recording (run) whole and assigns recordings to splits. ``official`` uses the
             published run-level splits (M3N-VC, ICT, West Point: their held-out runs become
             test) and falls back to ``record`` for the other datasets. ``holdout`` sends every
             recording matching ``holdout`` to test and splits the rest into train and val by
@@ -65,10 +87,11 @@ class SplitConfig:
         seed: Seed for the random assignment.
         gap_seconds: ``time`` only. Clips this close after a cut are dropped, so neighbouring
             audio does not end up on both sides of a boundary.
-        stratify: ``record`` only. Recordings are shuffled and divided within each group that
-            shares these keys. A group with a single recording goes entirely to train. Adding
-            ``scene`` keeps every M3N-VC scene in both train and test, but most groups then hold
-            two recordings and split 1:1, far from ``ratios``.
+        stratify: ``record``, and the fallback of ``official`` and ``holdout``. Recordings are
+            shuffled and divided within each group that shares these keys. A group with a single
+            recording goes entirely to train. Adding ``scene`` keeps every M3N-VC scene in both
+            train and test, but most groups then hold two recordings and split 1:1, far from
+            ``ratios``.
         holdout: ``holdout`` only. Names of what to hold out: a dataset (``GracesQuarters``), a
             subset path (``GracesQuarters/day_2_sensor_all``) or a dataset scene
             (``M3N-VC/s31``).
@@ -82,6 +105,12 @@ class SplitConfig:
     holdout: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        """Validate the settings.
+
+        Raises:
+            ValueError: If the ratios are negative, do not sum to 1 or give train nothing, if
+                ``holdout`` is empty for the holdout strategy, or if ``gap_seconds`` is negative.
+        """
         if any(r < 0 for r in self.ratios) or not math.isclose(sum(self.ratios), 1.0):
             raise ValueError(f"split ratios must be non-negative and sum to 1, got {self.ratios}")
         if self.ratios[0] == 0:
@@ -97,10 +126,10 @@ class SamplingConfig:
     """How training examples are cut out of the continuous recordings.
 
     Attributes:
-        mode: ``clip`` yields single original clips (2 s). ``multi_clip`` yields ``num_clips``
-            consecutive clips concatenated. ``random_crop`` yields windows of ``window_seconds``
-            starting anywhere; during training each epoch uses a grid with a fresh random offset
-            per recording, so every moment is used about once per epoch.
+        mode: ``clip`` yields single original clips (2 s). ``multi_clip`` (default) yields
+            ``num_clips`` consecutive clips concatenated. ``random_crop`` yields windows of
+            ``window_seconds`` starting anywhere; during training each epoch uses a grid with a
+            fresh random offset per recording, so every moment is used about once per epoch.
         num_clips: ``multi_clip`` only. Clips per example.
         clip_stride: ``multi_clip`` only. Clips between consecutive example starts; defaults to
             ``num_clips`` (non-overlapping, as FOCAL's sequence sampler).
@@ -116,6 +145,11 @@ class SamplingConfig:
     eval_stride_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        """Validate the settings.
+
+        Raises:
+            ValueError: If a count is below 1 or a duration is not positive.
+        """
         if self.num_clips < 1:
             raise ValueError(f"num_clips must be at least 1, got {self.num_clips}")
         if self.clip_stride is not None and self.clip_stride < 1:
@@ -138,9 +172,9 @@ class SpectralConfig:
 
     Attributes:
         representation: ``waveform`` (no transform), ``magnitude`` (|X|), ``log_magnitude``
-            (log(|X| + eps)) or ``complex`` (real and imaginary parts as two channels).
-        window_seconds: STFT frame length.
-        hop_seconds: STFT frame step.
+            (log(|X| + eps), default) or ``complex`` (real and imaginary parts as two channels).
+        window_seconds: STFT frame length. Must be whole samples at every modality's rate.
+        hop_seconds: STFT frame step. Must be whole samples at every modality's rate.
         window: ``hann`` or ``rect``. ``rect`` with window = hop = 0.2 s reproduces the
             per-interval FFT of FOCAL / cs537aiot.
         log_eps: Added before the log in ``log_magnitude``.
@@ -155,6 +189,11 @@ class SpectralConfig:
     placement: SpectralPlacement = "device"
 
     def __post_init__(self) -> None:
+        """Validate the settings.
+
+        Raises:
+            ValueError: If a frame duration or ``log_eps`` is not positive.
+        """
         if self.window_seconds <= 0 or self.hop_seconds <= 0:
             raise ValueError("STFT window_seconds and hop_seconds must be positive")
         if self.log_eps <= 0:
@@ -198,6 +237,12 @@ class DataConfig:
     cache_dir: Path | None = None
 
     def __post_init__(self) -> None:
+        """Validate the settings.
+
+        Raises:
+            ValueError: If no subset is given, the modalities are empty or repeated, a rate is
+                not positive, ``batch_size`` is below 1 or ``num_workers`` is negative.
+        """
         if not self.subsets:
             raise ValueError("at least one subset is required")
         if not self.modalities or len(set(self.modalities)) != len(self.modalities):
@@ -208,5 +253,12 @@ class DataConfig:
             raise ValueError("batch_size must be >= 1 and num_workers >= 0")
 
     def rate(self, modality: Modality) -> int:
-        """Return the common sample rate of ``modality`` in Hz."""
+        """Return the common sample rate of a modality.
+
+        Args:
+            modality: The modality to look up.
+
+        Returns:
+            ``audio_rate`` or ``seismic_rate`` in Hz.
+        """
         return self.audio_rate if modality == "audio" else self.seismic_rate

@@ -1,5 +1,8 @@
 """Build the train/val/test data loaders from a ``DataConfig``.
 
+``build_data`` runs the whole pipeline (manifest, split, segments, store, samplers, loaders) and
+returns an ``IoBTData`` that holds the loaders and everything needed to interpret their batches.
+
 Typical use::
 
     data = build_data(DataConfig(cache_dir=Path("cache/data")))
@@ -83,12 +86,25 @@ class IoBTData:
         return self.table.classes
 
     def set_epoch(self, epoch: int) -> None:
-        """Lay out the windows of ``epoch`` in every split."""
+        """Lay out the windows of an epoch in every split.
+
+        Args:
+            epoch: Epoch number.
+        """
         for sampler in self.samplers.values():
             sampler.set_epoch(epoch)
 
     def prepare(self, batch: Example, device: torch.device | str) -> Example:
-        """Move ``batch`` to ``device`` and apply the STFT there if it runs on the device."""
+        """Make a loader batch ready for the model.
+
+        Args:
+            batch: A batch from one of ``loaders``.
+            device: Where the model runs.
+
+        Returns:
+            The batch on ``device``, with the STFT applied there if ``spectral.placement`` is
+            ``device``.
+        """
         moved = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         if self.config.spectral.placement == "device":
             with torch.no_grad():
@@ -99,13 +115,25 @@ class IoBTData:
     def iterate(
         self, split: SplitName, *, epoch: int = 0, device: torch.device | str = "cpu"
     ) -> Iterator[Example]:
-        """Yield the prepared batches of ``split`` for ``epoch``."""
+        """Iterate over one epoch of a split.
+
+        Args:
+            split: Which split; must be in ``loaders``.
+            epoch: Epoch number; sets the window layout of the split first.
+            device: Where the batches should end up.
+
+        Yields:
+            Batches prepared with ``prepare``.
+
+        Raises:
+            KeyError: If ``split`` has no loader (it has no examples).
+        """
         self.samplers[split].set_epoch(epoch)
         for batch in self.loaders[split]:
             yield self.prepare(batch, device)
 
     def summary(self) -> dict[SplitName, SplitSummary]:
-        """Return the size of every split."""
+        """Return the size of every split, including empty ones."""
         clips = self.segments.num_clips()
         out: dict[SplitName, SplitSummary] = {}
         for code, name in enumerate(SPLIT_NAMES):
@@ -117,12 +145,29 @@ class IoBTData:
 
 
 def tick_rate(config: DataConfig) -> int:
-    """Return the finest time step shared by all modalities, in Hz."""
+    """Return the finest time step shared by all modalities.
+
+    Args:
+        config: Supplies the modalities and their rates.
+
+    Returns:
+        The greatest common divisor of the modality rates, in Hz.
+    """
     return math.gcd(*(config.rate(m) for m in config.modalities))
 
 
 def cache_key(config: DataConfig) -> str:
-    """Hash the settings that determine the stored signals."""
+    """Hash the settings that determine the stored signals.
+
+    Sampling and spectral settings are left out: they only affect how windows are cut from the
+    store, so changing them reuses the cache.
+
+    Args:
+        config: The data settings.
+
+    Returns:
+        A 16-character hex digest.
+    """
     fields = {
         "version": _CACHE_VERSION,
         "root": str(config.root.resolve()),
@@ -135,7 +180,16 @@ def cache_key(config: DataConfig) -> str:
 
 
 def _store(config: DataConfig, table: ClipTable, segments: SegmentIndex) -> SignalStore:
-    """Load the signals, from the cache when it already holds them."""
+    """Load the normalised signals, from the cache when it already holds them.
+
+    Args:
+        config: The data settings.
+        table: The clips.
+        segments: The segments to load.
+
+    Returns:
+        The store; memory-mapped whenever ``config.cache_dir`` is set.
+    """
     rates: dict[Modality, int] = {m: config.rate(m) for m in config.modalities}
     cached = None if config.cache_dir is None else config.cache_dir / cache_key(config)
     if cached is not None and cached.exists():
@@ -145,6 +199,7 @@ def _store(config: DataConfig, table: ClipTable, segments: SegmentIndex) -> Sign
     normalize_store(store, table, segments, config.normalization)
     if cached is not None:
         save_store(store, cached)
+        # Reopen as a memory map so this run behaves exactly like later cached runs.
         return open_store(cached)
     return store
 
@@ -152,6 +207,16 @@ def _store(config: DataConfig, table: ClipTable, segments: SegmentIndex) -> Sign
 def _loader(
     config: DataConfig, dataset: WindowDataset, sampler: WindowSampler
 ) -> DataLoader[Example]:
+    """Wrap a dataset and its sampler in a DataLoader.
+
+    Args:
+        config: Supplies batch size and worker count.
+        dataset: The split's dataset.
+        sampler: The split's sampler.
+
+    Returns:
+        The DataLoader.
+    """
     # Fork so workers share the in-memory signals instead of receiving a pickled copy.
     context = "fork" if config.num_workers > 0 else None
     return DataLoader(
@@ -172,7 +237,20 @@ def _split_loader(
     transform: SpectralTransform | None,
     name: SplitName,
 ) -> tuple[WindowSampler, DataLoader[Example]] | None:
-    """Return the sampler and loader of split ``name``, or None if it has no examples."""
+    """Build the sampler and loader of one split.
+
+    Args:
+        config: The data settings.
+        store: Waveforms of all segments.
+        table: The clips.
+        segments: All segments; only those of split ``name`` are used.
+        transform: STFT to run in the workers, or None.
+        name: Which split.
+
+    Returns:
+        The sampler and loader, or None if the split has no examples. A warning is logged when
+        the split has segments but none is long enough for one window.
+    """
     ticks = tick_rate(config)
     clip_ticks = round(table.clip_seconds * ticks)
     grid = window_grid(config.sampling, clip_ticks, ticks, train=name == "train")
@@ -190,7 +268,18 @@ def _split_loader(
 
 
 def build_data(config: DataConfig) -> IoBTData:
-    """Read, split, resample and normalise the data, and build one loader per split."""
+    """Read, split, resample and normalise the data, and build one loader per split.
+
+    Args:
+        config: The data settings.
+
+    Returns:
+        The loaders with their samplers and metadata.
+
+    Raises:
+        ValueError: If a setting is incompatible with the data (e.g. an STFT frame that is not
+            whole samples, or subsets with different clip durations).
+    """
     # The transform validates the STFT settings, so build it before the slow loading.
     transform = SpectralTransform(config.spectral, {m: config.rate(m) for m in config.modalities})
     table = load_clip_table(Path(config.root), config.subsets)

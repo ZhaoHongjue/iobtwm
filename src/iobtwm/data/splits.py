@@ -1,7 +1,13 @@
 """Assign clips to train/val/test.
 
-Each strategy returns one code per clip of a ``ClipTable``: the index of the split in
-``SPLIT_NAMES`` (0 = train, 1 = val, 2 = test) or ``DROPPED`` for clips that belong to no split.
+This is the second pipeline stage. ``assign_splits`` dispatches to one function per
+``SplitConfig.strategy``. Each returns one code per clip of a ``ClipTable``: the index of the
+split in ``SPLIT_NAMES`` (0 = train, 1 = val, 2 = test) or ``DROPPED`` for clips that belong to
+no split (only ``time`` drops clips, in the gaps after its cuts).
+
+The record-level strategies (``record``, ``official``, ``holdout``) share ``_assign_records``,
+which shuffles recordings within stratification groups and divides each group with
+``allocate_records``.
 """
 
 from __future__ import annotations
@@ -20,12 +26,22 @@ from iobtwm.data.manifest import ClipTable
 logger = logging.getLogger(__name__)
 
 DROPPED: Final[int] = -1
+"""Split code of clips that belong to no split."""
 
+# Runs in the West Point training split (splits/2026-04-14-West-Point/indices/train_index).
 _WEST_POINT_TRAIN_RUNS: Final[frozenset[int]] = frozenset({0, 1, 2, 6, 7, 8})
 
 
 def assign_splits(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8]:
-    """Return the split code of every clip in ``table`` according to ``config.strategy``."""
+    """Return the split code of every clip according to ``config.strategy``.
+
+    Args:
+        table: The clips to split.
+        config: Split settings.
+
+    Returns:
+        One code per row of ``table``: 0 train, 1 val, 2 test or ``DROPPED``.
+    """
     match config.strategy:
         case "random_clip":
             return split_random_clip(len(table), config.ratios, config.seed)
@@ -40,7 +56,15 @@ def assign_splits(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8]
 
 
 def _counts(n: int, ratios: tuple[float, float, float]) -> tuple[int, int]:
-    """Return how many of ``n`` items go to train and val; the rest go to test."""
+    """Return how many of ``n`` items go to train and val; the rest go to test.
+
+    Args:
+        n: Number of items.
+        ratios: (train, val, test) fractions.
+
+    Returns:
+        (train count, val count), both rounded down.
+    """
     n_train = math.floor(n * ratios[0])
     n_val = math.floor(n * ratios[1])
     return n_train, n_val
@@ -52,7 +76,16 @@ def split_random_clip(
     """Assign each clip independently at random, like the early group papers did on MOD.
 
     Neighbouring clips of one recording land in different splits, so test scores are optimistic.
-    It is kept to reproduce published numbers.
+    It is kept to reproduce published numbers. Exactly ``floor(n * ratio)`` clips go to train and
+    to val; the remainder goes to test.
+
+    Args:
+        n: Number of clips.
+        ratios: (train, val, test) fractions.
+        seed: Seed of the permutation.
+
+    Returns:
+        One split code per clip.
     """
     order = np.random.default_rng(seed).permutation(n)
     n_train, n_val = _counts(n, ratios)
@@ -67,16 +100,27 @@ def split_time(
 ) -> npt.NDArray[np.int8]:
     """Cut every recording chronologically: the first part trains, then val, then test.
 
-    The cut points are placed on the clip index of each recording, shared by all its nodes.
-    Clips within ``gap_seconds`` after a cut are dropped, and with a zero test ratio the clips
-    left over by rounding are dropped too.
+    The cut points are placed on the clip index of each recording, shared by all its nodes, so
+    one moment never lands in two splits. Clips within ``gap_seconds`` after a cut are dropped,
+    and with a zero test ratio the clips left over by rounding are dropped too.
+
+    Args:
+        table: The clips to split.
+        ratios: (train, val, test) fractions of each recording's clip range.
+        gap_seconds: Duration dropped after each cut.
+
+    Returns:
+        One split code per row of ``table``.
     """
+    # The small epsilon keeps an exact multiple of the clip duration from rounding up.
     gap = math.ceil(gap_seconds / table.clip_seconds - 1e-9)
     codes = np.full(len(table), DROPPED, dtype=np.int8)
     for record in np.unique(table.record):
         mask = table.record == record
         clips = table.clip[mask]
         first = int(clips.min())
+        # Cut on the clip range rather than the clip count, so gaps in a recording do not shift
+        # the cut points between nodes.
         n_train, n_val = _counts(int(clips.max()) - first + 1, ratios)
         position = clips - first
         record_codes = np.full(len(clips), DROPPED, dtype=np.int8)
@@ -95,6 +139,13 @@ def allocate_records(n: int, ratios: tuple[float, float, float]) -> tuple[int, i
     Val only gets its rounded share, because many groups hold two or three recordings and a
     forced val recording in each would inflate val far beyond its ratio. Train always keeps at
     least one recording, so a single recording goes to train.
+
+    Args:
+        n: Number of recordings in the group.
+        ratios: (train, val, test) fractions.
+
+    Returns:
+        (train, val, test) counts summing to ``n``.
     """
     n_test = max(1, round(n * ratios[2])) if ratios[2] > 0 else 0
     n_val = round(n * ratios[1])
@@ -107,7 +158,15 @@ def allocate_records(n: int, ratios: tuple[float, float, float]) -> tuple[int, i
 
 
 def _first_rows(table: ClipTable) -> npt.NDArray[np.int64]:
-    """Return one ``ClipTable`` row of every recording, indexed by recording."""
+    """Return one ``ClipTable`` row of every recording.
+
+    Args:
+        table: The clips.
+
+    Returns:
+        Element ``r`` is a row of recording ``r``; per-recording properties (dataset, run, scene)
+        can be read from it.
+    """
     _, first = np.unique(table.record, return_index=True)
     rows: npt.NDArray[np.int64] = first.astype(np.int64)
     return rows
@@ -116,7 +175,17 @@ def _first_rows(table: ClipTable) -> npt.NDArray[np.int64]:
 def _record_groups(
     table: ClipTable, records: npt.NDArray[np.int64], stratify: tuple[StratifyKey, ...]
 ) -> dict[tuple[str, ...], list[int]]:
-    """Group ``records`` by the stratification keys in ``stratify``."""
+    """Group recordings by their stratification keys.
+
+    Args:
+        table: The clips.
+        records: Recording indices to group.
+        stratify: Keys to group by. ``labels`` is the set of classes present anywhere in the
+            recording, joined with ``+``.
+
+    Returns:
+        Recording indices per group key, in ascending order.
+    """
     groups: dict[tuple[str, ...], list[int]] = defaultdict(list)
     for record in records.tolist():
         mask = table.record == record
@@ -140,10 +209,17 @@ def _assign_records(
     ratios: tuple[float, float, float],
     record_code: npt.NDArray[np.int8],
 ) -> None:
-    """Write the split of every recording in ``records`` into ``record_code``.
+    """Assign whole recordings to splits, writing into ``record_code``.
 
     Recordings are shuffled within each stratification group and divided by
     ``allocate_records``. Groups with one recording go to train and are logged.
+
+    Args:
+        table: The clips.
+        records: Recording indices to assign.
+        config: Supplies the seed and the stratification keys.
+        ratios: (train, val, test) fractions for these recordings.
+        record_code: Split code per recording index; entries of ``records`` are overwritten.
     """
     rng = np.random.default_rng(config.seed)
     for key, members in sorted(_record_groups(table, records, config.stratify).items()):
@@ -153,11 +229,20 @@ def _assign_records(
         n_train, n_val, _ = allocate_records(len(order), ratios)
         boundaries = (n_train, n_train + n_val)
         for position, record in enumerate(order):
+            # Positions below n_train give 0, below n_train + n_val give 1, the rest give 2.
             record_code[record] = np.searchsorted(boundaries, position, side="right")
 
 
 def split_record(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8]:
-    """Keep every recording whole and assign whole recordings to splits."""
+    """Keep every recording whole and assign whole recordings to splits.
+
+    Args:
+        table: The clips to split.
+        config: Supplies ratios, seed and stratification keys.
+
+    Returns:
+        One split code per row of ``table``.
+    """
     record_code = np.zeros(len(table.records), dtype=np.int8)
     all_records = np.arange(len(table.records), dtype=np.int64)
     _assign_records(table, all_records, config, config.ratios, record_code)
@@ -166,11 +251,18 @@ def split_record(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8]:
 
 
 def official_code(dataset: str, run: int) -> int | None:
-    """Return the published split of a run (0 train, 2 test), or None if there is none.
+    """Return the published split of a run.
 
     M3N-VC and ICT train on even runs and hold out odd runs. West Point trains on runs 0-2 and
     6-8 and holds out the rest (``splits/2026-04-14-West-Point/indices``). ICT and West Point
     call their held-out runs "val"; here they are test, like M3N-VC.
+
+    Args:
+        dataset: Dataset name.
+        run: Run number.
+
+    Returns:
+        0 (train) or 2 (test), or None if the dataset has no published run-level split.
     """
     match dataset:
         case "M3N-VC" | "ICT":
@@ -182,7 +274,16 @@ def official_code(dataset: str, run: int) -> int | None:
 
 
 def split_official(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8]:
-    """Use the published run-level splits where they exist, ``record`` elsewhere."""
+    """Use the published run-level splits where they exist, ``record`` elsewhere.
+
+    Args:
+        table: The clips to split.
+        config: Ratios, seed and stratification keys for the datasets without an official
+            split.
+
+    Returns:
+        One split code per row of ``table``.
+    """
     record_code = np.zeros(len(table.records), dtype=np.int8)
     rest: list[int] = []
     for record, row in enumerate(_first_rows(table).tolist()):
@@ -197,7 +298,16 @@ def split_official(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8
 
 
 def record_names(table: ClipTable, row: int) -> set[str]:
-    """Return the names a ``holdout`` entry can use to select the recording of ``row``."""
+    """Return the names a ``holdout`` entry can use to select the recording of a row.
+
+    Args:
+        table: The clips.
+        row: Any row of the recording.
+
+    Returns:
+        The dataset name, the subset path and, where the dataset has scenes,
+        ``<dataset>/<scene>``.
+    """
     dataset = table.datasets[table.dataset[row]]
     names = {dataset, table.subsets[table.subset[row]].name}
     scene = table.scenes[table.scene[row]]
@@ -208,6 +318,14 @@ def record_names(table: ClipTable, row: int) -> set[str]:
 
 def split_holdout(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8]:
     """Send held-out recordings to test and split the rest into train and val by recording.
+
+    Args:
+        table: The clips to split.
+        config: Supplies the ``holdout`` names, and the train:val proportion, seed and
+            stratification keys for the remaining recordings.
+
+    Returns:
+        One split code per row of ``table``.
 
     Raises:
         ValueError: If a ``holdout`` name matches no recording, or every recording is held out.
@@ -225,6 +343,7 @@ def split_holdout(table: ClipTable, config: SplitConfig) -> npt.NDArray[np.int8]
         raise ValueError(f"holdout names match no recording: {sorted(unknown)}")
     if not rest:
         raise ValueError("holdout leaves no recording for training")
+    # The held-out recordings are the test set, so the rest only splits into train and val.
     train, val, _ = config.ratios
     ratios = (train / (train + val), val / (train + val), 0.0)
     _assign_records(table, np.asarray(rest, dtype=np.int64), config, ratios, record_code)

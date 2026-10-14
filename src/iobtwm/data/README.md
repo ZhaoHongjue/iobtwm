@@ -2,6 +2,8 @@
 
 这个包把 `datasets_unified/` 里的数据变成训练时直接能用的 DataLoader。所有能调的东西都是 `DataConfig` 里的一个字段，换设置不用改代码。
 
+每个类、函数、参数的详细说明见参考文档 [`docs/data-package.md`](../../../docs/data-package.md)。
+
 ## 怎么用
 
 ```python

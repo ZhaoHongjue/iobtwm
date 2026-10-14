@@ -1,4 +1,10 @@
-"""Map a ``WindowKey`` to one training example."""
+"""Map a ``WindowKey`` to one training example.
+
+This is the last pipeline stage before batching. ``WindowDataset`` is a map-style dataset whose
+keys are ``WindowKey`` tuples produced by a ``WindowSampler``, not integer indices: it cuts the
+window out of the in-memory segment waveforms, optionally applies the STFT, and attaches the
+labels of the clips the window touches.
+"""
 
 from __future__ import annotations
 
@@ -18,13 +24,26 @@ from iobtwm.data.spectral import SpectralTransform
 from iobtwm.data.store import SignalStore
 
 Example = dict[str, Tensor]
-"""One example: a tensor per modality plus ``labels`` (multi-hot over the classes of every
-clip the window touches), ``distance`` (nearest vehicle distance in metres over those clips, NaN
-if unknown), ``dataset`` (index into ``ClipTable.datasets``), ``segment`` and ``start_seconds``."""
+"""One example (or, after collation, one batch with a leading batch dimension).
+
+Keys:
+    audio, seismic: Waveform ``[samples]`` or spectrum ``[channels, freq, frames]`` per
+        modality in ``DataConfig.modalities``.
+    labels: float32 multi-hot ``[classes]`` over every clip the window touches.
+    distance: float32 scalar, nearest vehicle distance in metres over those clips, NaN if
+        unknown.
+    dataset: int64 index into ``ClipTable.datasets``.
+    segment: int64 segment index.
+    start_seconds: float32 window start within its segment.
+"""
 
 
 class WindowDataset(Dataset[Example]):
-    """Cut windows out of the continuous segment waveforms."""
+    """Cut windows out of the continuous segment waveforms.
+
+    Index it with a ``WindowKey``; it has no length of its own because the set of windows is
+    decided per epoch by the sampler.
+    """
 
     def __init__(
         self,
@@ -37,7 +56,7 @@ class WindowDataset(Dataset[Example]):
         remove_dc: bool,
         transform: SpectralTransform | None,
     ) -> None:
-        """Create a dataset reading from ``store``.
+        """Create a dataset reading from a store.
 
         Args:
             store: Waveforms of all segments.
@@ -54,20 +73,41 @@ class WindowDataset(Dataset[Example]):
         self.transform = transform
         self.clip_ticks = round(table.clip_seconds * tick_rate)
         self.window_ticks = window_ticks
+        # Per-clip targets in segment order, so a window's clips are one contiguous slice.
         self.clip_offsets = segments.offsets
         self.clip_labels = table.labels[segments.clips]
         self.clip_distance = table.distance[segments.clips]
         self.segment_dataset = table.dataset[segments.first_clips()].astype(np.int64)
 
     def _wave(self, modality: Modality, segment: int, start: int) -> Tensor:
+        """Copy one window of one modality out of the store.
+
+        Args:
+            modality: Which modality.
+            segment: Segment index.
+            start: Window start in ticks within the segment.
+
+        Returns:
+            The window as a float32 tensor, with its mean removed if ``remove_dc`` is set.
+        """
         per_tick = self.store.rates[modality] // self.tick_rate
         first = int(self.store.offsets[modality][segment]) + start * per_tick
+        # np.array copies, so the store (possibly a read-only memory map) is never modified.
         wave = np.array(self.store.signals[modality][first : first + self.window_ticks * per_tick])
         if self.remove_dc:
             wave -= wave.mean()
         return torch.from_numpy(wave)
 
     def _targets(self, segment: int, start: int) -> tuple[npt.NDArray[np.bool_], float]:
+        """Return the labels and distance of the clips a window touches.
+
+        Args:
+            segment: Segment index.
+            start: Window start in ticks within the segment.
+
+        Returns:
+            The union of the clips' labels and the smallest known distance (NaN if none).
+        """
         base = int(self.clip_offsets[segment])
         first = base + start // self.clip_ticks
         last = base + math.ceil((start + self.window_ticks) / self.clip_ticks)
@@ -77,6 +117,14 @@ class WindowDataset(Dataset[Example]):
         return labels, float(known.min()) if len(known) else math.nan
 
     def __getitem__(self, key: WindowKey) -> Example:
+        """Return the example of one window.
+
+        Args:
+            key: (segment index, start tick).
+
+        Returns:
+            The example, see ``Example``.
+        """
         segment, start = key
         example: Example = {m: self._wave(m, segment, start) for m in self.store.rates}
         if self.transform is not None:

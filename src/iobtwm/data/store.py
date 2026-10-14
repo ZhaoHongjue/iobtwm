@@ -1,8 +1,14 @@
 """Continuous waveforms of every segment, resampled to common rates and kept in memory.
 
-Each segment is read from ``signals.h5`` as one block of consecutive clips, joined into one
-waveform and resampled as a whole, so clip borders carry no resampling artefacts. All segments
-of a modality live in one flat float32 array; ``offsets`` locate each segment.
+This is the fourth pipeline stage. Each segment is read from ``signals.h5`` as one block of
+consecutive clips, joined into one waveform and resampled as a whole, so clip borders carry no
+resampling artefacts. All segments of a modality live in one flat float32 array; ``offsets``
+locate each segment. ``normalize_store`` then rescales the amplitudes with statistics of the
+train split, and ``save_store`` / ``open_store`` cache the result as memory-mapped ``.npy`` files.
+
+Because every segment is a whole number of clips and every clip is a whole number of samples at
+the target rates, the flat array of a modality can be reshaped to ``[clips, clip_samples]`` with
+rows in ``SegmentIndex.clips`` order. Normalisation relies on that.
 """
 
 from __future__ import annotations
@@ -33,8 +39,10 @@ class SignalStore:
 
     Attributes:
         rates: Sample rate of each modality in Hz.
-        signals: Concatenated waveforms of all segments.
-        offsets: Segment ``i`` of modality ``m`` is ``signals[m][offsets[m][i]:offsets[m][i + 1]]``.
+        signals: Concatenated waveforms of all segments, in segment order. May be a read-only
+            memory map when opened from a cache.
+        offsets: ``len(segments) + 1`` boundaries per modality; segment ``i`` of modality ``m``
+            is ``signals[m][offsets[m][i]:offsets[m][i + 1]]``.
     """
 
     rates: dict[Modality, int]
@@ -42,13 +50,30 @@ class SignalStore:
     offsets: dict[Modality, npt.NDArray[np.int64]]
 
     def segment(self, modality: Modality, index: int) -> npt.NDArray[np.float32]:
-        """Return the waveform of segment ``index``."""
+        """Return the waveform of one segment.
+
+        Args:
+            modality: Which modality.
+            index: Segment index.
+
+        Returns:
+            A view into ``signals``; copy it before modifying.
+        """
         bounds = self.offsets[modality]
         return self.signals[modality][bounds[index] : bounds[index + 1]]
 
 
 def resample(wave: npt.NDArray[np.float64], source: float, target: int) -> npt.NDArray[np.float32]:
-    """Resample ``wave`` from ``source`` Hz to ``target`` Hz with a polyphase filter.
+    """Resample a waveform with a polyphase anti-aliasing filter.
+
+    Args:
+        wave: One-dimensional waveform.
+        source: Its sample rate in Hz; must be a whole number.
+        target: The wanted sample rate in Hz.
+
+    Returns:
+        The waveform at ``target`` Hz with ``ceil(len(wave) * target / source)`` samples.
+        Unchanged (only cast) when the rates are equal.
 
     Raises:
         ValueError: If ``source`` is not an integer rate.
@@ -63,7 +88,19 @@ def resample(wave: npt.NDArray[np.float64], source: float, target: int) -> npt.N
 
 
 def _read_rows(dataset: h5py.Dataset, rows: npt.NDArray[np.int64]) -> npt.NDArray[np.float64]:
-    """Read ``rows`` (any order) of a 2-D HDF5 dataset and join them into one waveform."""
+    """Read rows of a 2-D HDF5 dataset and join them into one waveform.
+
+    One contiguous slice covering all rows is read and the rows are picked from it, which is
+    much faster than HDF5 fancy indexing. Rows of one segment are close together (Parkland
+    interleaves ``_dwt`` rows, so the slice is about twice as large there).
+
+    Args:
+        dataset: An HDF5 dataset of shape ``[rows, samples]``.
+        rows: Rows to read, in the order they should be joined.
+
+    Returns:
+        The rows concatenated, as float64.
+    """
     low, high = int(rows.min()), int(rows.max())
     block = np.asarray(dataset[low : high + 1])
     return block[rows - low].reshape(-1).astype(np.float64)
@@ -76,7 +113,20 @@ def _load_modality(
     modality: Modality,
     rate: int,
 ) -> list[npt.NDArray[np.float32]]:
-    """Return the resampled waveform of every segment for one modality."""
+    """Read and resample one modality of every segment.
+
+    Each HDF5 file is opened once and all its segments are read in turn.
+
+    Args:
+        root: The unified root directory.
+        table: The clips, for subsets, HDF5 rows and native rates.
+        segments: The segments to read.
+        modality: Which modality.
+        rate: Target sample rate in Hz.
+
+    Returns:
+        One waveform per segment, in segment order.
+    """
     pieces: list[npt.NDArray[np.float32]] = [np.zeros(0, dtype=np.float32)] * len(segments)
     segment_subset = table.subset[segments.first_clips()]
     for subset_index in np.unique(segment_subset):
@@ -99,8 +149,18 @@ def load_store(
 ) -> SignalStore:
     """Read, join and resample the waveforms of all segments.
 
+    Args:
+        root: The unified root directory.
+        table: The clips.
+        segments: The segments to load.
+        rates: Target sample rate per modality; also selects the modalities to load.
+
+    Returns:
+        The store, not yet normalised.
+
     Raises:
-        ValueError: If a clip does not span a whole number of samples at a target rate.
+        ValueError: If a clip does not span a whole number of samples at a target rate, or a
+            resampled segment does not have exactly ``clips * clip_samples`` samples.
     """
     signals: dict[Modality, npt.NDArray[np.float32]] = {}
     offsets: dict[Modality, npt.NDArray[np.int64]] = {}
@@ -121,7 +181,16 @@ def load_store(
 def _scale_keys(
     table: ClipTable, clips: npt.NDArray[np.int64], normalization: Normalization
 ) -> npt.NDArray[np.int64]:
-    """Return the normalisation group of each clip."""
+    """Return the normalisation group of each clip.
+
+    Args:
+        table: The clips.
+        clips: ``ClipTable`` rows to look up.
+        normalization: ``dataset`` groups by dataset; anything else by (dataset, node).
+
+    Returns:
+        One integer group id per entry of ``clips``.
+    """
     if normalization == "dataset":
         return table.dataset[clips].astype(np.int64)
     return table.dataset[clips].astype(np.int64) * len(table.nodes) + table.node[clips]
@@ -134,8 +203,17 @@ def clip_scales(
 ) -> npt.NDArray[np.float64]:
     """Return a scale for every clip: the median train RMS of its group.
 
-    Silent clips are ignored. Groups without usable train clips get the median of the other
-    groups' scales, or 1 if there are none.
+    The median is robust to the few loud clips where a vehicle passes close by. Silent clips are
+    ignored. Groups without usable train clips get the median of the other groups' scales, or 1
+    if there are none.
+
+    Args:
+        clip_rms: RMS of every clip (after removing its mean).
+        keys: Normalisation group of every clip.
+        is_train: Whether every clip is in the train split.
+
+    Returns:
+        The scale of every clip.
     """
     usable = is_train & (clip_rms > 0)
     groups, inverse = np.unique(keys, return_inverse=True)
@@ -156,12 +234,21 @@ def normalize_store(
     segments: SegmentIndex,
     normalization: Normalization,
 ) -> None:
-    """Divide every clip in place by the train-split scale of its (dataset, node) or dataset."""
+    """Divide every clip in place by the train-split scale of its group.
+
+    Args:
+        store: The store to rescale; its arrays must be writable.
+        table: The clips.
+        segments: The segments ``store`` was built from.
+        normalization: ``node`` for one scale per (dataset, node), ``dataset`` for one per
+            dataset, ``none`` to leave the store untouched.
+    """
     if normalization == "none":
         return
     keys = _scale_keys(table, segments.clips, normalization)
     is_train = np.repeat(segments.split == 0, segments.num_clips())
     for modality, rate in store.rates.items():
+        # A view with one row per clip, in segments.clips order (see the module docstring).
         clips = store.signals[modality].reshape(-1, round(table.clip_seconds * rate))
         rms = clips.std(axis=1, dtype=np.float64)
         scales = clip_scales(rms, keys, is_train)
@@ -170,10 +257,14 @@ def normalize_store(
 
 
 def save_store(store: SignalStore, directory: Path) -> None:
-    """Write ``store`` to ``directory`` as ``.npy`` files.
+    """Write a store to a directory as ``.npy`` files.
 
     The files are written to a temporary sibling first and renamed, so a crash never leaves a
     half-written cache behind.
+
+    Args:
+        store: The store to save.
+        directory: Target directory; must not exist yet.
     """
     tmp = directory.with_name(f"{directory.name}.tmp")
     tmp.mkdir(parents=True, exist_ok=True)
@@ -185,7 +276,17 @@ def save_store(store: SignalStore, directory: Path) -> None:
 
 
 def open_store(directory: Path) -> SignalStore:
-    """Memory-map a store written by ``save_store``."""
+    """Open a store written by ``save_store``.
+
+    The signals are memory-mapped read-only, so opening is instant and forked DataLoader workers
+    share the pages instead of copying them.
+
+    Args:
+        directory: A directory written by ``save_store``.
+
+    Returns:
+        The store.
+    """
     rates: dict[Modality, int] = json.loads((directory / "rates.json").read_text())
     signals: dict[Modality, npt.NDArray[np.float32]] = {}
     offsets: dict[Modality, npt.NDArray[np.int64]] = {}
