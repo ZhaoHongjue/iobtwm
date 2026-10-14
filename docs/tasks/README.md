@@ -56,7 +56,7 @@ import pyarrow.parquet as pq
 root = "datasets_unified/M3N-VC/a06/individual_time_samples"
 rows = pq.read_table(f"{root}/manifest.parquet").to_pylist()
 with h5py.File(f"{root}/signals.h5", "r") as h5:
-    audio = h5["signals/audio"][0]      # 1-D 波形，dtype 和原始文件一样
+    audio = h5["signals/audio"][0]  # 1-D 波形，dtype 和原始文件一样
     seismic = h5["signals/seismic"][0]
 print(rows[0]["labels"], rows[0]["distances_m"], rows[0]["node"])
 ```

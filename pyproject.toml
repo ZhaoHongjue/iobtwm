@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "pyarrow>=26.0.0",
+    "scipy>=1.18.1",
     "torch>=2.14.1",
 ]
 
@@ -28,6 +29,7 @@ dev = [
     "pyarrow-stubs>=20.0.0.20260819",
     "pytest>=9.1.1",
     "ruff>=0.17.0",
+    "scipy-stubs>=1.18.1.1",
 ]
 
 [tool.ruff]
